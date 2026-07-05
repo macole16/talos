@@ -1,0 +1,96 @@
+{
+    "interfaces": [
+        {
+            "id": 1,
+            "purpose": "public",
+            "label": null,
+            "ipam_address": null,
+            "vpc": null
+        },
+        {
+            "id": 2,
+            "purpose": "vpc",
+            "label": null,
+            "ipam_address": null,
+            "vpc": {
+                "id": 10,
+                "label": "prod",
+                "subnet": {
+                    "id": 20,
+                    "label": "nodes",
+                    "ipv4": {
+                        "subnet_range": "10.20.0.0/24",
+                        "instance_address": "10.20.0.10/32",
+                        "nat_1_1": null,
+                        "instance_ranges": []
+                    },
+                    "ipv6": null
+                }
+            }
+        },
+        {
+            "id": 3,
+            "purpose": "vlan",
+            "label": "vlan-priv",
+            "ipam_address": "192.168.5.10/24",
+            "vpc": null
+        },
+        {
+            "id": 4,
+            "purpose": "vpc",
+            "label": null,
+            "ipam_address": null,
+            "vpc": {
+                "id": 11,
+                "label": "prod",
+                "subnet": {
+                    "id": 21,
+                    "label": "ipv6-only",
+                    "ipv4": null,
+                    "ipv6": null
+                }
+            }
+        },
+        {
+            "id": 5,
+            "purpose": "vpc",
+            "label": null,
+            "ipam_address": null,
+            "vpc": {
+                "id": 12,
+                "label": "prod",
+                "subnet": {
+                    "id": 22,
+                    "label": "incomplete",
+                    "ipv4": {
+                        "subnet_range": null,
+                        "instance_address": "10.30.0.10/32",
+                        "nat_1_1": null,
+                        "instance_ranges": []
+                    },
+                    "ipv6": null
+                }
+            }
+        }
+    ],
+    "ipv4": {
+        "public": [
+            "172.1.2.3/32"
+        ],
+        "private": [
+            "192.1.2.3/32"
+        ],
+        "shared": [],
+        "vpc": [
+            "10.20.0.10/32"
+        ]
+    },
+    "ipv6": {
+        "slaac": "2600:3c06::f03c:93ff:fe6e:5cd9/128",
+        "ranges": [
+            "2600:3c05:d011:797::/64"
+        ],
+        "link_local": "fe80::f03c:93ff:fe6e:5cd9/128",
+        "shared_ranges": []
+    }
+}

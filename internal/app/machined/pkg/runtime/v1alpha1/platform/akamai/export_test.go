@@ -4,4 +4,7 @@
 
 package akamai
 
-var ConvertTagsFromAkamai = convertTagsFromAkamai
+var (
+	ConvertTagsFromAkamai = convertTagsFromAkamai
+	PhysicalLinkNames     = physicalLinkNames
+)
