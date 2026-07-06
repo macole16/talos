@@ -50,7 +50,28 @@ func (a *Akamai) ParseMetadata(
 	interfaceAddresses *NetworkData,
 	linkNames []string,
 ) (*runtime.PlatformNetworkConfig, bool, error) {
-	networkConfig := &runtime.PlatformNetworkConfig{}
+	networkConfig := &runtime.PlatformNetworkConfig{
+		Metadata: &runtimeres.PlatformMetadataSpec{
+			Platform:     a.Name(),
+			Hostname:     metadata.Label,
+			Region:       metadata.Region,
+			InstanceType: metadata.Type,
+			InstanceID:   strconv.Itoa(metadata.ID),
+			ProviderID:   fmt.Sprintf("linode://%d", metadata.ID),
+			Tags:         convertTagsFromAkamai(metadata.Tags),
+		},
+	}
+
+	// The Akamai metadata service publishes the instance and network data
+	// progressively over the first seconds of boot. Configuring from an
+	// incomplete snapshot and caching it would, for example, leave a VPC
+	// interface that has not appeared in the interface list yet to Talos's
+	// default DHCPv4 operator and its competing default route. Request a
+	// reconcile and retry until the data is complete (reconcileNetworkConfig
+	// re-fetches each pass).
+	if metadataIncomplete(metadata, interfaceAddresses) {
+		return networkConfig, true, nil
+	}
 
 	if metadata.Label != "" {
 		hostnameSpec := network.HostnameSpecSpec{
@@ -79,17 +100,27 @@ func (a *Akamai) ParseMetadata(
 		needsReconcile = true
 	}
 
-	networkConfig.Metadata = &runtimeres.PlatformMetadataSpec{
-		Platform:     a.Name(),
-		Hostname:     metadata.Label,
-		Region:       metadata.Region,
-		InstanceType: metadata.Type,
-		InstanceID:   strconv.Itoa(metadata.ID),
-		ProviderID:   fmt.Sprintf("linode://%d", metadata.ID),
-		Tags:         convertTagsFromAkamai(metadata.Tags),
+	return networkConfig, needsReconcile, nil
+}
+
+// metadataIncomplete reports whether the Akamai metadata service has not yet
+// finished publishing the instance and network data. It fills them progressively
+// over the first seconds of boot, so an early fetch can return a missing instance
+// label or an empty interface/address set; configuring from such a snapshot and
+// caching it would strand a VPC interface on Talos's default DHCPv4 operator. The
+// reconcile loop retries until this returns false.
+func metadataIncomplete(metadata *akametadata.InstanceData, interfaceAddresses *NetworkData) bool {
+	// A real instance always has a label; an empty one means the instance data
+	// has not been published yet.
+	if metadata.Label == "" {
+		return true
 	}
 
-	return networkConfig, needsReconcile, nil
+	// The network data must describe at least one addressable interface: the
+	// instance-wide public addresses (dual-homed and single-NIC nodes) or an
+	// interface entry (VPC-only nodes have no public address). Neither present
+	// means the network data has not been published yet.
+	return len(interfaceAddresses.IPv4.Public) == 0 && len(interfaceAddresses.Interfaces) == 0
 }
 
 // configurePublicAddresses adds the instance-wide public, private and IPv6
@@ -229,7 +260,7 @@ func (a *Akamai) NetworkConfiguration(ctx context.Context, st state.State, ch ch
 		return fmt.Errorf("error waiting for devices to be ready: %w", err)
 	}
 
-	return a.reconcileNetworkConfig(ctx, st, ch)
+	return a.reconcileNetworkConfig(ctx, st, ch, fetchNetworkMetadata)
 }
 
 // fetchNetworkMetadata retrieves the instance and network metadata. The network
@@ -261,23 +292,27 @@ func fetchNetworkMetadata(ctx context.Context) (*akametadata.InstanceData, *Netw
 	return metadata, interfaceAddresses, nil
 }
 
-// reconcileNetworkConfig retries the metadata->config mapping until every
-// physical link is enumerated, exporting the best-effort config on each pass
-// (mirrors the openstack driver).
+// metadataFetcher retrieves the instance and network metadata. It is passed into
+// the reconcile loop so tests can inject a fake that simulates the metadata
+// service's progressive population at boot.
+type metadataFetcher func(ctx context.Context) (*akametadata.InstanceData, *NetworkData, error)
+
+// reconcileNetworkConfig retries the metadata->config mapping until the metadata
+// is complete and every physical link is enumerated, re-fetching on each pass and
+// exporting the best-effort config (mirrors the openstack driver). The Akamai
+// metadata service publishes instance/network data progressively at boot (see
+// metadataIncomplete and configureVPCInterfaces), so re-fetching lets a later
+// pass pick up data an earlier one lacked instead of caching the gap.
 func (a *Akamai) reconcileNetworkConfig(
 	ctx context.Context,
 	st state.State,
 	ch chan<- *runtime.PlatformNetworkConfig,
+	fetch metadataFetcher,
 ) error {
 	bckoff := backoff.NewExponentialBackOff()
 
 	for {
-		// Re-fetch metadata on every pass rather than caching a single response:
-		// the Akamai metadata service attaches an interface's "vpc" object a moment
-		// after it publishes the top-level addresses, so an early fetch can return a
-		// VPC interface with a nil "vpc" field. Re-fetching lets a later pass pick up
-		// the VPC data once the service populates it (see configureVPCInterfaces).
-		metadata, interfaceAddresses, err := fetchNetworkMetadata(ctx)
+		metadata, interfaceAddresses, err := fetch(ctx)
 		if err != nil {
 			return err
 		}

@@ -5,15 +5,21 @@
 package akamai_test
 
 import (
+	"context"
 	_ "embed"
 	"encoding/json"
 	"testing"
+	"time"
 
+	"github.com/cosi-project/runtime/pkg/state"
+	"github.com/cosi-project/runtime/pkg/state/impl/inmem"
+	"github.com/cosi-project/runtime/pkg/state/impl/namespaced"
 	akametadata "github.com/linode/go-metadata"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.yaml.in/yaml/v4"
 
+	"github.com/siderolabs/talos/internal/app/machined/pkg/runtime"
 	"github.com/siderolabs/talos/internal/app/machined/pkg/runtime/v1alpha1/platform/akamai"
 	"github.com/siderolabs/talos/pkg/machinery/nethelpers"
 	"github.com/siderolabs/talos/pkg/machinery/resources/network"
@@ -207,4 +213,148 @@ func TestConvertTagsFromAkamai(t *testing.T) {
 			assert.Equal(t, tt.expected, akamai.ConvertTagsFromAkamai(tt.input))
 		})
 	}
+}
+
+func TestMetadataIncomplete(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		instance string
+		network  string
+		expected bool
+	}{
+		{
+			name:     "empty instance data requests reconcile",
+			instance: `{}`,
+			network:  `{"interfaces":[],"ipv4":{"public":["172.1.2.3/32"]},"ipv6":{}}`,
+			expected: true,
+		},
+		{
+			name:     "empty network data requests reconcile",
+			instance: `{"label":"talos"}`,
+			network:  `{"interfaces":[],"ipv4":{"public":[]},"ipv6":{}}`,
+			expected: true,
+		},
+		{
+			name:     "single-nic node is complete",
+			instance: `{"label":"talos"}`,
+			network:  `{"interfaces":[],"ipv4":{"public":["172.1.2.3/32"]},"ipv6":{}}`,
+			expected: false,
+		},
+		{
+			name:     "vpc-only node is complete",
+			instance: `{"label":"talos"}`,
+			network:  string(rawNetworkVPCOnly),
+			expected: false,
+		},
+		{
+			name:     "dual-homed node is complete",
+			instance: string(rawInstanceNoTags),
+			network:  string(rawNetworkDualNIC),
+			expected: false,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var instance akametadata.InstanceData
+
+			var netData akamai.NetworkData
+
+			require.NoError(t, json.Unmarshal([]byte(tt.instance), &instance))
+			require.NoError(t, json.Unmarshal([]byte(tt.network), &netData))
+
+			assert.Equal(t, tt.expected, akamai.MetadataIncomplete(&instance, &netData))
+		})
+	}
+}
+
+// TestReconcileNetworkConfigProgressiveMetadata simulates the Akamai metadata
+// service publishing data in stages at boot: (0) empty, (1) instance + public +
+// interfaces but the VPC interface's "vpc" object still nil, (2) fully populated.
+// The driver must re-fetch and retry until stage 2 and then configure the VPC
+// address on eth1, rather than caching an early, incomplete snapshot.
+func TestReconcileNetworkConfigProgressiveMetadata(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	t.Cleanup(cancel)
+
+	st := state.WrapCore(namespaced.NewState(inmem.Build))
+
+	// Two physical NICs in PCI order: eth0 (public), eth1 (VPC).
+	for _, l := range []struct{ id, bus string }{{"eth0", "0000:00:03.0"}, {"eth1", "0000:00:04.0"}} {
+		link := network.NewLinkStatus(network.NamespaceName, l.id)
+		link.TypedSpec().Type = nethelpers.LinkEther
+		link.TypedSpec().BusPath = l.bus
+		require.NoError(t, st.Create(ctx, link))
+	}
+
+	var emptyInstance, fullInstance akametadata.InstanceData
+
+	require.NoError(t, json.Unmarshal([]byte(`{}`), &emptyInstance))
+	require.NoError(t, json.Unmarshal(rawInstanceNoTags, &fullInstance))
+
+	var emptyNet, pendingNet, fullNet akamai.NetworkData
+
+	require.NoError(t, json.Unmarshal([]byte(`{"interfaces":[],"ipv4":{"public":[]},"ipv6":{}}`), &emptyNet))
+	require.NoError(t, json.Unmarshal(rawNetworkDualNICVPCPending, &pendingNet))
+	require.NoError(t, json.Unmarshal(rawNetworkDualNIC, &fullNet))
+
+	stages := []struct {
+		instance *akametadata.InstanceData
+		network  *akamai.NetworkData
+	}{
+		{&emptyInstance, &emptyNet},
+		{&fullInstance, &pendingNet},
+		{&fullInstance, &fullNet},
+	}
+
+	call := 0
+	fetch := func(context.Context) (*akametadata.InstanceData, *akamai.NetworkData, error) {
+		idx := call
+		if idx >= len(stages) {
+			idx = len(stages) - 1
+		}
+
+		call++
+
+		return stages[idx].instance, stages[idx].network, nil
+	}
+
+	p := &akamai.Akamai{}
+	ch := make(chan *runtime.PlatformNetworkConfig, len(stages)+2)
+	errCh := make(chan error, 1)
+
+	go func() {
+		errCh <- p.ReconcileNetworkConfig(ctx, st, ch, fetch)
+	}()
+
+	select {
+	case err := <-errCh:
+		require.NoError(t, err)
+	case <-ctx.Done():
+		require.FailNow(t, "timed out waiting for reconcile to complete")
+	}
+
+	close(ch)
+
+	var last *runtime.PlatformNetworkConfig
+
+	for cfg := range ch {
+		last = cfg
+	}
+
+	// It progressed through all three stages...
+	assert.GreaterOrEqual(t, call, 3)
+
+	// ...and the final config configures the VPC address on eth1 (the fix).
+	require.NotNil(t, last)
+
+	var eth1 *network.AddressSpecSpec
+
+	for i := range last.Addresses {
+		if last.Addresses[i].LinkName == "eth1" {
+			eth1 = &last.Addresses[i]
+		}
+	}
+
+	require.NotNil(t, eth1, "expected a platform-layer address on eth1")
+	assert.Equal(t, "10.20.0.10/24", eth1.Address.String())
+	assert.Equal(t, network.ConfigPlatform, eth1.ConfigLayer)
 }
