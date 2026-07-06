@@ -34,6 +34,9 @@ var rawNetworkDualNIC []byte
 //go:embed testdata/network-vpc-only.json
 var rawNetworkVPCOnly []byte
 
+//go:embed testdata/network-dual-nic-vpc-pending.json
+var rawNetworkDualNICVPCPending []byte
+
 //go:embed testdata/expected-no-tags.yaml
 var expectedNoTags string
 
@@ -106,6 +109,19 @@ func TestParseMetadata(t *testing.T) {
 			instance:       rawInstanceNoTags,
 			network:        rawNetworkDualNIC,
 			linkNames:      nil,
+			expected:       expectedNoTags,
+			needsReconcile: true,
+		},
+		{
+			// The VPC interface's "vpc" object has not been populated by the
+			// metadata service yet (a boot-time race): the links are enumerated but
+			// the interface is left unconfigured this pass and a reconcile is
+			// requested so a later fetch can pick up the VPC data. Output degrades
+			// to the public-only config.
+			name:           "vpc metadata not populated yet requests reconcile",
+			instance:       rawInstanceNoTags,
+			network:        rawNetworkDualNICVPCPending,
+			linkNames:      []string{"eth0", "eth1"},
 			expected:       expectedNoTags,
 			needsReconcile: true,
 		},

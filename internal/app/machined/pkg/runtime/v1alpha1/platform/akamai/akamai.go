@@ -229,12 +229,7 @@ func (a *Akamai) NetworkConfiguration(ctx context.Context, st state.State, ch ch
 		return fmt.Errorf("error waiting for devices to be ready: %w", err)
 	}
 
-	metadata, interfaceAddresses, err := fetchNetworkMetadata(ctx)
-	if err != nil {
-		return err
-	}
-
-	return a.reconcileNetworkConfig(ctx, st, metadata, interfaceAddresses, ch)
+	return a.reconcileNetworkConfig(ctx, st, ch)
 }
 
 // fetchNetworkMetadata retrieves the instance and network metadata. The network
@@ -272,13 +267,21 @@ func fetchNetworkMetadata(ctx context.Context) (*akametadata.InstanceData, *Netw
 func (a *Akamai) reconcileNetworkConfig(
 	ctx context.Context,
 	st state.State,
-	metadata *akametadata.InstanceData,
-	interfaceAddresses *NetworkData,
 	ch chan<- *runtime.PlatformNetworkConfig,
 ) error {
 	bckoff := backoff.NewExponentialBackOff()
 
 	for {
+		// Re-fetch metadata on every pass rather than caching a single response:
+		// the Akamai metadata service attaches an interface's "vpc" object a moment
+		// after it publishes the top-level addresses, so an early fetch can return a
+		// VPC interface with a nil "vpc" field. Re-fetching lets a later pass pick up
+		// the VPC data once the service populates it (see configureVPCInterfaces).
+		metadata, interfaceAddresses, err := fetchNetworkMetadata(ctx)
+		if err != nil {
+			return err
+		}
+
 		hostInterfaces, err := safe.StateListAll[*network.LinkStatus](ctx, st)
 		if err != nil {
 			return fmt.Errorf("error listing host interfaces: %w", err)
@@ -388,7 +391,24 @@ func configureVPCInterfaces(networkConfig *runtime.PlatformNetworkConfig, interf
 	primaryIdx := primaryInterfaceIndex(interfaces)
 
 	for idx, iface := range interfaces {
-		if idx == primaryIdx || iface.Purpose != "vpc" || iface.VPC == nil || iface.VPC.Subnet.IPv4 == nil {
+		if idx == primaryIdx || iface.Purpose != "vpc" {
+			continue
+		}
+
+		// A VPC interface whose "vpc" object is still absent means the metadata
+		// service has not attached it yet (it populates the per-interface VPC data
+		// shortly after the top-level addresses at boot). Request a reconcile and
+		// retry rather than caching the gap and leaving the interface to Talos's
+		// default DHCPv4 operator, which would install a competing default route.
+		if iface.VPC == nil {
+			needsReconcile = true
+
+			continue
+		}
+
+		// A VPC subnet with no IPv4 addressing (e.g. an IPv6-only subnet) has
+		// nothing to configure here; skip it without forcing a reconcile.
+		if iface.VPC.Subnet.IPv4 == nil {
 			continue
 		}
 
